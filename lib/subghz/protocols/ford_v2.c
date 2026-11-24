@@ -7,6 +7,8 @@
 #include "../blocks/generic.h"
 #include "../blocks/math.h"
 
+#include "aes_common.h"
+
 #include <lib/toolbox/manchester_decoder.h>
 #include <string.h>
 
@@ -39,6 +41,9 @@
 #define FORD_V2_TAIL_RAW_BYTE_COUNT        5U
 #define FORD_V2_PREAMBLE_COUNT_MAX         0xFFFFU
 #define FORD_V2_ENCODER_DEFAULT_REPEAT     3U
+
+static const uint8_t ford_v2_aes_key[16] = {
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
 
 static const uint16_t ford_v2_sync_shift16_inv =
     (uint16_t)(~(((uint16_t)FORD_V2_SYNC_0 << 8) | (uint16_t)FORD_V2_SYNC_1));
@@ -74,7 +79,9 @@ typedef struct SubGhzProtocolDecoderFordV2 {
     uint64_t extra_data;
     uint16_t counter16;
     uint32_t tail31;
+    uint32_t tail31_calc;
     bool structure_ok;
+    bool tail_valid;
 } SubGhzProtocolDecoderFordV2;
 
 static void ford_v2_encoder_read_fields(
@@ -153,6 +160,8 @@ static void ford_v2_decoder_reset_state(SubGhzProtocolDecoderFordV2* instance) {
     instance->preamble_count = 0;
     instance->counter16 = 0;
     instance->tail31 = 0;
+    instance->tail31_calc = 0;
+    instance->tail_valid = false;
     instance->structure_ok = false;
 
     memset(instance->raw_bytes, 0, sizeof(instance->raw_bytes));
@@ -207,6 +216,30 @@ static const char* ford_v2_button_name(uint8_t btn) {
     }
 }
 
+static uint32_t ford_v2_compute_tail31(
+    uint32_t serial,
+    uint16_t counter16,
+    uint8_t btn,
+    const uint8_t* key16) {
+    uint8_t block[16] = {0};
+    block[0] = (uint8_t)(serial >> 24);
+    block[1] = (uint8_t)(serial >> 16);
+    block[2] = (uint8_t)(serial >> 8);
+    block[3] = (uint8_t)serial;
+    block[4] = (uint8_t)(counter16 >> 8);
+    block[5] = (uint8_t)counter16;
+    block[6] = btn;
+    block[7] = 0x80U;
+
+    uint8_t round_keys[176];
+    aes_key_expansion(key16, round_keys);
+    aes128_encrypt(round_keys, block);
+
+    uint32_t hop = ((uint32_t)block[4] << 24) | ((uint32_t)block[5] << 16) |
+                   ((uint32_t)block[6] << 8) | (uint32_t)block[7];
+    return hop & 0x7FFFFFFFU;
+}
+
 static void ford_v2_decoder_extract_from_raw(SubGhzProtocolDecoderFordV2* instance) {
     const uint8_t* k = instance->raw_bytes;
 
@@ -222,6 +255,10 @@ static void ford_v2_decoder_extract_from_raw(SubGhzProtocolDecoderFordV2* instan
 
     instance->tail31 = (((uint32_t)(k[9] & 0x7FU)) << 24) | ((uint32_t)k[10] << 16) |
                        ((uint32_t)k[11] << 8) | (uint32_t)k[12];
+
+    instance->tail31_calc = ford_v2_compute_tail31(
+        instance->generic.serial, instance->counter16, instance->generic.btn, ford_v2_aes_key);
+    instance->tail_valid = (instance->tail31_calc == instance->tail31);
 
     instance->structure_ok = true;
 
@@ -882,10 +919,12 @@ void subghz_protocol_decoder_ford_v2_get_string(void* context, FuriString* outpu
         ford_v2_button_name(instance->generic.btn));
     furi_string_cat_printf(
         output,
-        "Cnt:%04X Struct:%s\r\nTail31:%08lX\r\nTailRaw:%02X%02X%02X%02X%02X\r\n",
+        "Cnt:%04X Struct:%s\r\nTail31:%08lX Calc:%08lX [%s]\r\nTailRaw:%02X%02X%02X%02X%02X\r\n",
         (unsigned)instance->counter16,
         instance->structure_ok ? "OK" : "ERR",
         (unsigned long)instance->tail31,
+        (unsigned long)instance->tail31_calc,
+        instance->tail_valid ? "AES OK" : "AES ERR",
         k[8],
         k[9],
         k[10],
